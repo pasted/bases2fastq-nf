@@ -6,3 +6,12 @@ testing/
 testing*
 *.pyc
 .nf-test*
+
+# DISS Nextflow execution
+nxf-work/
+
+# Execution logs
+*.log
+
+# Python bytecode
+__pycache__/
