@@ -6,21 +6,16 @@ nextflow.enable.dsl = 2
 /*
  * DISS analysis workflow
  *
- * Stage 16:
- *   1. DISS_FINAL_GUIDE_ASSIGNMENTS
- *   2. DISS_GUIDE_INTEGRATION
- *   3. DISS_GUIDE_RESCUE_AUDIT
- *   4. DISS_GUIDE_FAMILY_CLASSIFICATION
- *   5. DISS_FINAL_EXPORT
- *
- * Inputs:
- *   Stage05k frozen guide evidence
- *   Stage05l P0/P3 guide evidence and QC
- *   Stage05l call identity and fixed cell universe
- *   Stage05i interoperability exports
+ * Processes:
+ *   1. DISS_BACKGROUND_ADJUSTED_GUIDE_CALLING
+ *   2. DISS_FINAL_GUIDE_ASSIGNMENTS
+ *   3. DISS_GUIDE_INTEGRATION
+ *   4. DISS_GUIDE_RESCUE_AUDIT
+ *   5. DISS_GUIDE_FAMILY_CLASSIFICATION
+ *   6. DISS_FINAL_EXPORT
  *
  * Scientific policies:
- *   - P3_SPECIFIC is the primary guide calling policy.
+ *   - P3_SPECIFIC is the primary guide-calling policy.
  *   - Primary guide calls require BH-adjusted q < 0.05.
  *   - FROZEN_ONLY assignments are provenance only.
  *   - Join cells using (well, cell_id).
@@ -33,6 +28,10 @@ nextflow.enable.dsl = 2
 // ---------------------------------------------------------------------
 // Module imports
 // ---------------------------------------------------------------------
+
+include {
+    DISS_BACKGROUND_ADJUSTED_GUIDE_CALLING
+} from './modules/local/diss_background_adjusted_guide_calling/main'
 
 include {
     DISS_FINAL_GUIDE_ASSIGNMENTS
@@ -91,11 +90,17 @@ workflow {
     // Input directories
     // -------------------------------------------------------------
 
+    def exact_dir =
+        "${root}/stage05k_cell_target_matrix"
+
     def frozen_dir =
         "${root}/stage05k_final_guide_calls"
 
-    def background_dir =
-        "${root}/stage05l_background_adjusted_guide_calling"
+    def rescue_dir =
+        "${root}/stage05l_rescue_validation"
+
+    def specificity_dir =
+        "${root}/stage05l_cross_guide_specificity"
 
     def qc_dir =
         "${root}/stage05l_call_quality_assessment"
@@ -105,6 +110,16 @@ workflow {
 
     def interoperability =
         "${root}/stage05i_interoperability_exports"
+
+
+    // -------------------------------------------------------------
+    // Stage05k exact annotated reads
+    // -------------------------------------------------------------
+
+    def exact_reads = file(
+        "${exact_dir}/B02_annotated_reads_with_cell_assignment.parquet",
+        checkIfExists: true
+    )
 
 
     // -------------------------------------------------------------
@@ -118,16 +133,21 @@ workflow {
 
 
     // -------------------------------------------------------------
-    // Stage05l guide calling evidence
+    // Stage05l rescued reads
     // -------------------------------------------------------------
 
-    def p0_evidence = file(
-        "${background_dir}/P0_EXACT_cell_construct_evidence.parquet",
+    def rescued_reads = file(
+        "${rescue_dir}/rescue_reads_spatially_annotated.parquet",
         checkIfExists: true
     )
 
-    def p3_evidence = file(
-        "${background_dir}/P3_SPECIFIC_cell_construct_evidence.parquet",
+
+    // -------------------------------------------------------------
+    // Stage05l cross-guide specificity
+    // -------------------------------------------------------------
+
+    def specificity = file(
+        "${specificity_dir}/rescue_all_guide_distances.parquet",
         checkIfExists: true
     )
 
@@ -218,241 +238,193 @@ workflow {
 
 
     // =============================================================
-    // Process 1: Final guide assignment export
+    // Process 1: Background-adjusted guide calling
     // =============================================================
 
-    DISS_FINAL_GUIDE_ASSIGNMENTS(
+    DISS_BACKGROUND_ADJUSTED_GUIDE_CALLING(
 
         Channel.value([
             meta,
+            exact_reads,
             frozen_stage05k,
-            p0_evidence,
-            p3_evidence,
-            qc_evidence,
-            identity,
-            fixed_cell_universe
-        ]),
+            rescued_reads,
+            specificity
+        ])
+    )
 
+
+    // -------------------------------------------------------------
+    // Regenerated P0 and P3 evidence
+    // -------------------------------------------------------------
+
+    def final_guide_inputs =
+        DISS_BACKGROUND_ADJUSTED_GUIDE_CALLING.out.primary_evidence.map {
+            meta_out, p0_evidence, p3_evidence ->
+
+            [
+                meta_out,
+                frozen_stage05k,
+                p0_evidence,
+                p3_evidence,
+                qc_evidence,
+                identity,
+                fixed_cell_universe
+            ]
+        }
+
+
+    // =============================================================
+    // Process 2: Final guide assignment export
+    // =============================================================
+
+    DISS_FINAL_GUIDE_ASSIGNMENTS(
+        final_guide_inputs,
         guide_export_script,
-
         params.diss_pilot_regression
     )
 
 
     // -------------------------------------------------------------
-    // Reuse generated guide outputs
+    // Shared final guide assignment outputs
     // -------------------------------------------------------------
 
-    /*
-     * The guide_exports channel contains:
-     *
-     * meta
-     * final_cell_guide_assignments.parquet
-     * final_cell_guide_matrix.parquet
-     * final_cell_guide_status.tsv
-     * final_export_manifest.json
-     *
-     * Nextflow dataflow channels allow the same output to be consumed
-     * independently by integration and audit processes.
-     */
+    def guide_exports =
+        DISS_FINAL_GUIDE_ASSIGNMENTS.out.guide_exports
 
 
     // =============================================================
-    // Process 2: DISS/guide integration
+    // Process 3: Guide integration
     // =============================================================
 
-    def integration_inputs =
-        DISS_FINAL_GUIDE_ASSIGNMENTS.out.guide_exports.map {
-            guide_meta,
-            guide_assignments,
-            guide_matrix,
-            guide_status,
-            guide_manifest ->
+    def integration_inputs = guide_exports.map {
+        meta_out, assignments, matrix, status, manifest ->
 
-            [
-                guide_meta,
-                diss_transcripts,
-                diss_cell_metadata,
-                guide_assignments,
-                guide_status,
-                guide_manifest
-            ]
-        }
-
+        [
+            meta_out,
+            diss_transcripts,
+            diss_cell_metadata,
+            assignments,
+            status,
+            manifest
+        ]
+    }
 
     DISS_GUIDE_INTEGRATION(
-
         integration_inputs,
-
         integration_script,
-
         params.diss_pilot_regression
     )
 
 
     // =============================================================
-    // Process 3: Guide rescue evidence audit
+    // Process 4: Rescue evidence audit
     // =============================================================
 
-    def audit_inputs =
-        DISS_FINAL_GUIDE_ASSIGNMENTS.out.guide_exports.map {
-            guide_meta,
-            guide_assignments,
-            guide_matrix,
-            guide_status,
-            guide_manifest ->
+    def audit_inputs = guide_exports.map {
+        meta_out, assignments, matrix, status, manifest ->
 
-            [
-                guide_meta,
-                guide_assignments,
-                guide_matrix
-            ]
-        }
-
+        [
+            meta_out,
+            assignments,
+            matrix
+        ]
+    }
 
     DISS_GUIDE_RESCUE_AUDIT(
-
         audit_inputs,
-
         audit_script,
-
         params.diss_pilot_regression
     )
 
 
     // =============================================================
-    // Process 4: Guide family classification
+    // Process 5: Guide family classification
     // =============================================================
 
-    def classification_inputs =
-        DISS_GUIDE_INTEGRATION.out.integrated.map {
-            integration_meta,
-            integrated_transcripts,
-            integrated_cells,
-            integrated_assignments,
-            integrated_guide_cells ->
+    def integrated =
+        DISS_GUIDE_INTEGRATION.out.integrated
 
-            [
-                integration_meta,
-                integrated_cells,
-                integrated_assignments
-            ]
-        }
+    def classification_inputs = integrated.map {
+        meta_out, transcripts, cells, assignments, guide_cells ->
 
+        [
+            meta_out,
+            cells,
+            assignments
+        ]
+    }
 
     DISS_GUIDE_FAMILY_CLASSIFICATION(
-
         classification_inputs,
-
         classifier_script
     )
 
 
     // =============================================================
-    // Process 5: Final interoperability export
+    // Process 6: Final interoperability exports
     // =============================================================
 
-    // -------------------------------------------------------------
-    // Key integration results
-    // -------------------------------------------------------------
+    // Convert metadata maps into scalar join keys.
 
-    def integration_for_export =
-        DISS_GUIDE_INTEGRATION.out.integrated.map {
-            integration_meta,
-            integrated_transcripts,
-            integrated_cells,
-            integrated_assignments,
-            integrated_guide_cells ->
+    def integrated_keyed = integrated.map {
+        meta_out, transcripts, cells, assignments, guide_cells ->
 
-            [
-                integration_meta.id,
-                integration_meta,
-                integrated_transcripts,
-                integrated_cells,
-                integrated_assignments,
-                integrated_guide_cells
-            ]
-        }
+        [
+            meta_out.id,
+            meta_out,
+            transcripts,
+            cells,
+            assignments,
+            guide_cells
+        ]
+    }
 
-
-    // -------------------------------------------------------------
-    // Key guide family classification results
-    // -------------------------------------------------------------
-
-    def classification_for_export =
-        DISS_GUIDE_FAMILY_CLASSIFICATION.out.classified.map {
-            classification_meta,
-            family_file,
-            family_manifest ->
-
-            [
-                classification_meta.id,
-                family_file,
-                family_manifest
-            ]
-        }
-
-
-    // -------------------------------------------------------------
-    // Key guide rescue audit results
-    // -------------------------------------------------------------
-
-    def audit_for_export =
+    def audit_keyed =
         DISS_GUIDE_RESCUE_AUDIT.out.evidence.map {
-            audit_meta,
-            audit_file ->
+            meta_out, evidence ->
 
             [
-                audit_meta.id,
-                audit_file
+                meta_out.id,
+                evidence
+            ]
+        }
+
+    def classified_keyed =
+        DISS_GUIDE_FAMILY_CLASSIFICATION.out.classified.map {
+            meta_out, family, family_manifest ->
+
+            [
+                meta_out.id,
+                family
             ]
         }
 
 
     // -------------------------------------------------------------
-    // Join integration and classification
+    // Join integrated, audit and classification outputs
     // -------------------------------------------------------------
 
-    def integrated_classified =
-        integration_for_export.join(
-            classification_for_export
-        )
-
-
-    // -------------------------------------------------------------
-    // Join rescue audit evidence
-    // -------------------------------------------------------------
-
-    def complete_export_inputs =
-        integrated_classified.join(
-            audit_for_export
-        )
-
-
-    // -------------------------------------------------------------
-    // Construct final exporter input tuple
-    // -------------------------------------------------------------
-
-    def export_inputs =
-        complete_export_inputs.map {
+    def final_export_inputs = integrated_keyed
+        .join(audit_keyed)
+        .join(classified_keyed)
+        .map {
             sample_id,
-            export_meta,
-            integrated_transcripts,
-            integrated_cells,
-            integrated_assignments,
-            integrated_guide_cells,
-            family_file,
-            family_manifest,
-            audit_file ->
+            meta_out,
+            transcripts,
+            cells,
+            assignments,
+            guide_cells,
+            evidence,
+            family ->
 
             [
-                export_meta,
-                integrated_transcripts,
-                integrated_cells,
-                integrated_assignments,
-                integrated_guide_cells,
-                audit_file,
-                family_file,
+                meta_out,
+                transcripts,
+                cells,
+                assignments,
+                guide_cells,
+                evidence,
+                family,
                 diss_feature_metadata,
                 diss_cell_metadata,
                 diss_target_counts,
@@ -461,16 +433,9 @@ workflow {
         }
 
 
-    // -------------------------------------------------------------
-    // Execute final exporter
-    // -------------------------------------------------------------
-
     DISS_FINAL_EXPORT(
-
-        export_inputs,
-
+        final_export_inputs,
         export_script,
-
         params.diss_pilot_regression
     )
 
